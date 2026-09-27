@@ -38,6 +38,7 @@ const state = {
   claims: [],      // 主持人：全部命题（逐组报告）；参与者：白名单含本组的命题（本组报告+汇总）；观察者：永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
+  latency: { round: null, data: null, timer: 0 }, // 主持人响应时效面板（round=null 跟随当前轮）
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
@@ -63,6 +64,8 @@ function showRoom() {
   $('#vehicles-panel').classList.toggle('hidden', state.role === 'observer');
   // 现场情报核验板对观察者完全不可见；主持人看逐组报告，参与组看本组与汇总状态
   $('#intel-panel').classList.toggle('hidden', state.role === 'observer');
+  // 响应时效面板仅主持人可见（参与者与观察席拿不到分析数据）
+  $('#latency-panel').classList.toggle('hidden', state.role !== 'host');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -1262,6 +1265,127 @@ function upsertClaim(view) {
   renderIntel();
 }
 
+/* ---------------------------------------------------------- 响应时效面板（仅主持人） */
+
+/* 虚拟毫秒差格式化：mm:ss.mmm（超 1 小时带小时位）；null 由调用方显示「未达 / 无数据」 */
+function fmtDelta(ms) {
+  const v = Math.max(0, Math.round(ms));
+  const s = Math.floor(v / 1000);
+  const mmm = String(v % 1000).padStart(3, '0');
+  const hh = Math.floor(s / 3600);
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return hh > 0 ? `${hh}:${mm}:${ss}.${mmm}` : `${mm}:${ss}.${mmm}`;
+}
+
+/* 拉取所选轮次的响应时效报告。服务端在状态锁内固定事件水位后统计：
+   暂停时长不计入，撤销回执/修改答复不改首次响应时间，未响应为 null（未达）。 */
+async function refreshLatency() {
+  if (state.role !== 'host' || !state.code) return;
+  const round = state.latency.round == null ? state.round : state.latency.round;
+  try {
+    const data = await api('GET', `/api/rooms/${state.code}/latency?round=${round}`);
+    state.latency.data = data;
+    renderLatency();
+  } catch (err) { /* 分析数据拉取失败不打断主界面（如轮次已失效） */ }
+}
+
+/* 揭示/回执/答复/重置/组增删事件后防抖刷新（面板为拉取式分析，不走增量事件） */
+function scheduleLatencyRefresh() {
+  if (state.role !== 'host') return;
+  clearTimeout(state.latency.timer);
+  state.latency.timer = setTimeout(refreshLatency, 400);
+}
+
+function renderLatency() {
+  if (state.role !== 'host') return;
+  const data = state.latency.data;
+  const sel = $('#latency-round');
+  const cur = data ? data.current_round : state.round;
+  const selected = data ? data.round
+    : (state.latency.round == null ? state.round : state.latency.round);
+  sel.innerHTML = '';
+  for (let r = 0; r <= cur; r++) {
+    const opt = document.createElement('option');
+    opt.value = String(r);
+    opt.textContent = `第 ${r + 1} 轮` + (r === cur ? '（当前）' : '');
+    sel.appendChild(opt);
+  }
+  sel.value = String(selected);
+  $('#latency-meta').textContent = data ? `事件水位 #${data.high_water_event_id}` : '';
+  const box = $('#latency-groups');
+  box.innerHTML = '';
+  const groups = data ? data.groups : [];
+  const hasCards = groups.some((g) => g.cards.length > 0);
+  $('#latency-empty').classList.toggle('hidden', hasCards);
+  for (const g of groups) {
+    if (g.cards.length > 0) box.appendChild(latencyGroupBlock(g));
+  }
+}
+
+/* 单个参与组的时效块：组名 + 两类中位时延（只取已响应样本）+ 逐卡明细表 */
+function latencyGroupBlock(g) {
+  const wrap = document.createElement('div');
+  wrap.className = 'latency-group';
+
+  const head = document.createElement('div');
+  head.className = 'latency-group-head';
+  const name = document.createElement('span');
+  name.className = 'latency-group-name';
+  name.textContent = g.group_name + (g.exists ? '' : '（已删除）');
+  head.appendChild(name);
+  const med = document.createElement('span');
+  med.className = 'latency-medians';
+  const recMed = g.receipt_median_ms == null ? '无数据' : fmtDelta(g.receipt_median_ms);
+  const ansMed = g.answer_median_ms == null ? '无数据' : fmtDelta(g.answer_median_ms);
+  med.textContent = `回执中位 ${recMed}（已响应 ${g.receipt_responded}/${g.cards.length}）`
+    + ` · 答复中位 ${ansMed}（已响应 ${g.answer_responded}/${g.cards.length}）`;
+  head.appendChild(med);
+  wrap.appendChild(head);
+
+  const table = document.createElement('table');
+  table.className = 'latency-table';
+  const thead = document.createElement('thead');
+  thead.innerHTML = '<tr><th>卡片</th><th>揭示</th><th>首次回执</th><th>首次答复</th></tr>';
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const c of g.cards) {
+    const tr = document.createElement('tr');
+    const cardCell = document.createElement('td');
+    cardCell.textContent = `#${c.seq} ${c.title} `;
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + (c.card_group_id == null ? 'badge-all' : 'badge-target');
+    badge.textContent = c.card_group_id == null ? '全员' : '定向';
+    cardCell.appendChild(badge);
+    tr.appendChild(cardCell);
+    const revCell = document.createElement('td');
+    revCell.className = 'latency-num';
+    revCell.textContent = `T+${fmt(c.revealed_at_ms || 0)}`;
+    tr.appendChild(revCell);
+    tr.appendChild(latencyCell(c.receipt_latency_ms));
+    tr.appendChild(latencyCell(c.answer_latency_ms));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+/* 单个时延单元格：已响应显示 +mm:ss.mmm，未响应显示「未达」（不以墙钟补足） */
+function latencyCell(ms) {
+  const td = document.createElement('td');
+  td.className = 'latency-num';
+  if (ms == null) {
+    const miss = document.createElement('span');
+    miss.className = 'latency-miss';
+    miss.textContent = '未达';
+    td.appendChild(miss);
+  } else {
+    td.textContent = `+${fmtDelta(ms)}`;
+  }
+  return td;
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
@@ -1271,6 +1395,7 @@ function renderAll() {
   renderPolls();
   renderVehicles();
   renderIntel();
+  renderLatency();
   renderCards();
 }
 
@@ -1325,6 +1450,7 @@ function applySnapshot(msg) {
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
   renderAll();
+  if (state.role === 'host') refreshLatency(); // 快照就绪后拉取响应时效面板数据
 }
 
 function applyEvent(msg) {
@@ -1547,6 +1673,11 @@ function applyEvent(msg) {
       syncClock('idle', 0);
       break;
   }
+  // 响应时效面板为拉取式分析：揭示/回执/答复/重置/组增删后防抖重取所选轮次数据
+  if (['card_revealed', 'receipt_updated', 'answer_updated', 'reset',
+       'group_added', 'group_removed'].includes(msg.type)) {
+    scheduleLatencyRefresh();
+  }
   renderAll();
 }
 
@@ -1640,6 +1771,8 @@ function enterRoom(code, role) {
   state.claims = [];
   state.round = 0;
   state.groupId = null;
+  clearTimeout(state.latency.timer);
+  state.latency = { round: null, data: null, timer: 0 };
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);
   showRoom();
@@ -1661,6 +1794,8 @@ function enterObserver(token) {
   state.claims = [];
   state.round = 0;
   state.groupId = null;
+  clearTimeout(state.latency.timer);
+  state.latency = { round: null, data: null, timer: 0 };
   location.hash = `#/observe/${token}`;
   showRoom();
   renderAll();
@@ -1701,6 +1836,14 @@ $('#btn-start').onclick  = () => api('POST', `/api/rooms/${state.code}/start`).c
 $('#btn-pause').onclick  = () => api('POST', `/api/rooms/${state.code}/pause`).catch(showError);
 $('#btn-resume').onclick = () => api('POST', `/api/rooms/${state.code}/resume`).catch(showError);
 $('#btn-reset').onclick  = () => api('POST', `/api/rooms/${state.code}/reset`).catch(showError);
+
+/* 响应时效面板：切换演练轮次 / 手动刷新（仅主持人；数据为拉取式分析） */
+$('#latency-round').onchange = () => {
+  const v = $('#latency-round').value;
+  state.latency.round = v === '' ? null : parseInt(v, 10);
+  refreshLatency();
+};
+$('#latency-refresh').onclick = () => refreshLatency();
 
 /* 导出复盘 ZIP：按点击瞬间的事件水位打包（服务端在锁内定水位，生成期间新事件不混入）。
    直接走浏览器下载，无需解析 JSON；导出进行中禁用按钮并提示。 */

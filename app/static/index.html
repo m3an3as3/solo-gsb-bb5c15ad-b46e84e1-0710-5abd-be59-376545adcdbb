@@ -226,6 +226,22 @@
       <p id="intel-empty" class="hint">暂无待核验命题</p>
       <ul id="intel-list" class="intel-list"></ul>
     </section>
+
+    <!-- 响应时效面板（仅主持人可见；参与者与观察席拿不到分析数据） -->
+    <section id="latency-panel" class="panel hidden">
+      <h2>响应时效</h2>
+      <p class="hint">按演练轮次统计：每张卡片<strong>揭示时刻的目标组</strong>到<strong>首次回执</strong>与
+        <strong>首次答复</strong>的虚拟毫秒差（暂停时长不计入；撤销回执或修改答复不影响首次响应时间；
+        重置后从新一轮重新统计）。未响应记为「未达」，不以墙钟补足时延；
+        两类中位时延只取已响应样本，空样本显示「无数据」。</p>
+      <div class="latency-toolbar">
+        <select id="latency-round" title="选择演练轮次"></select>
+        <button id="latency-refresh" class="group-op" type="button">刷新</button>
+        <span id="latency-meta" class="hint"></span>
+      </div>
+      <p id="latency-empty" class="hint">该轮暂无已揭示的卡片</p>
+      <div id="latency-groups"></div>
+    </section>
   </main>
 
   <script src="/static/app.js"></script>

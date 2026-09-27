@@ -43,6 +43,12 @@
   且对立为零为已证实/已否定；其余为待核验。主持人实时看到逐组报告；
   参与组只见本组报告与汇总状态；观察席完全不可见。报告持久化，
   经快照与 WebSocket 恢复；重置清空报告但保留命题
+- 响应时效面板（仅主持人）：按演练轮次统计每张卡片揭示时各目标组到
+  首次回执、首次答复的虚拟毫秒差；服务端在 state_lock 内固定事件水位后
+  复用时钟事件重建轮次与虚拟时间（暂停时长不计入，重置后从新一轮统计）；
+  撤销回执或修改答复不改首次响应时间；未响应记为未达，不用墙钟补足时延；
+  逐组给出两类中位时延（只取已响应样本，空样本为无数据）；
+  参与者与观察席拿不到分析数据
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -63,7 +69,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NamedTuple
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -71,6 +77,7 @@ from pydantic import BaseModel, Field
 from . import db as dbmod
 from . import export as reviewmod
 from . import intel as intelmod
+from . import latency as latencymod
 from . import polls as pollmod
 from . import vehicles as vehiclemod
 
@@ -1789,6 +1796,34 @@ async def export_review_zip(code: str):
             "Cache-Control": "no-store",
         },
     )
+
+
+# ---------------------------------------------------------------- REST：响应时效面板
+
+@app.get("/api/rooms/{code}/latency")
+async def latency_report(code: str, round_idx: int | None = Query(default=None, alias="round")):
+    """主持人专用的响应时效面板：按演练轮次统计各目标组到首次回执/首次答复的虚拟毫秒差。
+
+    与导出同一水位口径：在 state_lock 内（与所有状态写操作同一把锁）先固定
+    事件水位 high_water = MAX(events.id)，随后只消费 id <= 水位的事件，
+    复用时钟事件重建轮次与虚拟时间（暂停时长不计入）——生成期间到达的新事件
+    绝不混入。撤销回执/修改答复不改首次响应时间；未响应为 null（未达），
+    不用墙钟补足时延；中位数只取已响应样本，空样本为 null（无数据）。
+
+    仅主持人可获取：房间码即主持人凭证，参与者的组加入码与观察凭证都不是
+    房间码，在此路径一律 404；分析数据也不进入任何快照或广播事件。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        high_water = db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events WHERE room_id = ?", (room["id"],)
+        ).fetchone()["m"]
+        selected = current_round(room["id"]) if round_idx is None else round_idx
+        try:
+            return latencymod.build_latency_report(
+                db, room["id"], selected, high_water, room_elapsed_ms(room))
+        except latencymod.LatencyError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
 
 # ---------------------------------------------------------------- REST：时钟控制

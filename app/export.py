@@ -47,7 +47,7 @@ _NOSCRIPT_MARKER = "__REVIEW_DATA_SUMMARY__"
 
 # ---------------------------------------------------------------- 时间线 / 轮次
 
-def _build_timeline(events: list[sqlite3.Row], elapsed_now_ms: int):
+def build_timeline(events: list[sqlite3.Row], elapsed_now_ms: int):
     """把事件流加工为「时钟动作」「轮次元数据」与「按轮次定位的事件时间线」。
 
     每次 reset 结束当前轮次并开启新一轮：编排（组/卡片）跨轮次保留，
@@ -55,6 +55,9 @@ def _build_timeline(events: list[sqlite3.Row], elapsed_now_ms: int):
     时钟所处的运行段推导——运行中事件挂靠当前运行段起点（记录该段
     开始的墙钟时刻），暂停中事件取冻结值；时钟/重置动作自身带权威
     elapsed_ms。
+
+    本函数同时被 app.latency（响应时效面板）复用：同一份时钟事件重建逻辑，
+    保证复盘导出与响应时延统计的轮次划分、虚拟时间口径完全一致。
     """
     clock_actions: list[dict] = []
     timeline: list[dict] = []
@@ -348,7 +351,7 @@ def build_review_data(conn: sqlite3.Connection, room: sqlite3.Row, high_water: i
         kept_rows.append(ev)
 
     elapsed_now = _elapsed_ms(room)
-    clock_actions, rounds_meta, timeline = _build_timeline(kept_rows, elapsed_now)
+    clock_actions, rounds_meta, timeline = build_timeline(kept_rows, elapsed_now)
 
     # 事件时间线对外只暴露脱敏载荷（与 _sanitize_event 同一口径）
     timeline_out = [{
