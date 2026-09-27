@@ -36,6 +36,9 @@ const state = {
   polls: [],       // 主持人：全部轮次投票；参与者：本轮本组投票；观察者：永远为空
   vehicles: null,  // 主持人：{total, remaining, requests}；参与者：{my_request}；观察者：null
   claims: [],      // 主持人：全部命题（逐组报告）；参与者：白名单含本组的命题（本组报告+汇总）；观察者：永远为空
+  latency: null,   // 主持人：响应时效报告（逐组逐卡首次回执/答复时延）；其他角色不获取
+  latencyRound: null, // 主持人：时效面板选中的轮次；null = 跟随当前轮
+  latencyError: null, // 主持人：时效报告最近一次加载失败信息（无则为 null）
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
@@ -63,6 +66,8 @@ function showRoom() {
   $('#vehicles-panel').classList.toggle('hidden', state.role === 'observer');
   // 现场情报核验板对观察者完全不可见；主持人看逐组报告，参与组看本组与汇总状态
   $('#intel-panel').classList.toggle('hidden', state.role === 'observer');
+  // 响应时效面板仅主持人可见（参与者与观察席不渲染，服务端也不向其提供分析数据）
+  $('#latency-panel').classList.toggle('hidden', state.role !== 'host');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -1262,6 +1267,155 @@ function upsertClaim(view) {
   renderIntel();
 }
 
+/* ---------------------------------------------------------- 响应时效面板（仅主持人） */
+
+/* 影响统计口径的事件：揭示/回执/答复/组增删改/重置。时钟动作不改变已固定的
+   首次响应时间，不触发刷新；统计本身在服务端按事件水位一次性取数。 */
+const LATENCY_EVENTS = new Set([
+  'card_revealed', 'receipt_updated', 'answer_updated',
+  'group_added', 'group_removed', 'group_renamed', 'reset',
+]);
+let latencyTimer = null;
+let latencySeq = 0; // 请求序号：只应用最后一次请求的响应，避免慢响应覆盖新选择
+
+function latencyEffectiveRound() {
+  return state.latencyRound == null ? state.round : state.latencyRound;
+}
+
+function scheduleLatencyRefresh() {
+  if (state.role !== 'host' || !state.code) return;
+  clearTimeout(latencyTimer);
+  latencyTimer = setTimeout(fetchLatency, 300);
+}
+
+/* 拉取所选轮次的时效报告（服务端在状态锁内按事件水位取数） */
+async function fetchLatency() {
+  if (state.role !== 'host' || !state.code) return;
+  const round = latencyEffectiveRound();
+  const seq = ++latencySeq;
+  try {
+    const report = await api('GET', `/api/rooms/${state.code}/response-latency?round=${round}`);
+    if (seq !== latencySeq) return; // 期间已发起更新的请求
+    state.latency = report;
+  } catch (err) {
+    if (seq !== latencySeq) return;
+    state.latency = null;
+    state.latencyError = err.message || '加载失败';
+  }
+  renderLatency();
+}
+
+function latencyText(ms) {
+  return ms == null ? '未达' : fmt(ms);
+}
+
+function latencyMedianText(ms) {
+  return ms == null ? '无数据' : fmt(ms);
+}
+
+/* 主持人：轮次选择 + 逐组逐卡明细与两类中位时延 */
+function renderLatency() {
+  if (state.role !== 'host') return;
+  // 轮次下拉：第 1..N 轮（N = 当前轮）；尽量保留已选，未选过则跟随当前轮
+  const sel = $('#latency-round');
+  sel.innerHTML = '';
+  for (let i = 0; i <= state.round; i++) {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = `第 ${i + 1} 轮` + (i === state.round ? '（当前）' : '');
+    sel.appendChild(opt);
+  }
+  sel.value = String(Math.min(latencyEffectiveRound(), state.round));
+
+  const box = $('#latency-groups');
+  box.innerHTML = '';
+  const meta = $('#latency-meta');
+  const empty = $('#latency-empty');
+  const report = state.latency;
+  if (!report) {
+    meta.textContent = state.latencyError || '';
+    empty.classList.remove('hidden');
+    empty.textContent = state.latencyError
+      ? '加载失败，请点击「刷新统计」重试' : '点击「刷新统计」加载该轮响应时效';
+    return;
+  }
+  state.latencyError = null;
+  meta.textContent = `第 ${report.round + 1} 轮 · 事件水位 #${report.high_water_event_id}`;
+  const groups = report.groups || [];
+  empty.classList.toggle('hidden', groups.length > 0);
+  empty.textContent = '该轮暂无已揭示卡片或目标组';
+  const names = new Map(groups.map((g) => [g.group_id, g.group_name]));
+  for (const g of groups) box.appendChild(latencyGroupBlock(g, names));
+}
+
+/* 单个参与组块：组名 + 两类中位时延 + 逐卡明细表 */
+function latencyGroupBlock(g, names) {
+  const div = document.createElement('div');
+  div.className = 'latency-group';
+
+  const head = document.createElement('div');
+  head.className = 'latency-group-head';
+  const name = document.createElement('span');
+  name.className = 'latency-group-name';
+  name.textContent = g.group_name;
+  head.appendChild(name);
+  if (!g.present) {
+    const gone = document.createElement('span');
+    gone.className = 'badge badge-pending';
+    gone.textContent = '已删除';
+    head.appendChild(gone);
+  }
+  const medians = document.createElement('span');
+  medians.className = 'latency-medians';
+  const mr = document.createElement('span');
+  mr.className = 'receipt-chip ' + (g.median_receipt_ms == null ? 'receipt-wait' : 'receipt-ok');
+  mr.textContent = `回执中位 ${latencyMedianText(g.median_receipt_ms)}`;
+  medians.appendChild(mr);
+  const ma = document.createElement('span');
+  ma.className = 'receipt-chip ' + (g.median_answer_ms == null ? 'receipt-wait' : 'receipt-ok');
+  ma.textContent = `答复中位 ${latencyMedianText(g.median_answer_ms)}`;
+  medians.appendChild(ma);
+  head.appendChild(medians);
+  div.appendChild(head);
+
+  const table = document.createElement('table');
+  table.className = 'latency-table';
+  const thead = document.createElement('tr');
+  for (const h of ['卡片', '揭示', '首次回执', '首次答复']) {
+    const th = document.createElement('th');
+    th.textContent = h;
+    thead.appendChild(th);
+  }
+  table.appendChild(thead);
+  for (const c of g.cards) {
+    const tr = document.createElement('tr');
+    const card = document.createElement('td');
+    card.textContent = `#${c.seq} ${c.title}`;
+    const target = document.createElement('span');
+    target.className = 'badge ' + (c.group_id == null ? 'badge-all' : 'badge-target');
+    target.textContent = c.group_id == null ? '全员' : `仅 ${names.get(c.group_id) || groupName(c.group_id)}`;
+    card.appendChild(document.createTextNode(' '));
+    card.appendChild(target);
+    tr.appendChild(card);
+    const rev = document.createElement('td');
+    rev.textContent = `T+${fmt(c.revealed_at_ms || 0)}`;
+    tr.appendChild(rev);
+    const rec = document.createElement('td');
+    rec.textContent = latencyText(c.receipt_ms);
+    if (c.receipt_ms == null) rec.className = 'latency-miss';
+    else rec.title = `首次回执于 T+${fmt(c.receipt_at_ms)}`;
+    tr.appendChild(rec);
+    const ans = document.createElement('td');
+    ans.textContent = latencyText(c.answer_ms);
+    if (c.answer_ms == null) ans.className = 'latency-miss';
+    else ans.title = `首次答复于 T+${fmt(c.answer_at_ms)}`;
+    tr.appendChild(ans);
+    table.appendChild(tr);
+  }
+  div.appendChild(table);
+  return div;
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
@@ -1271,6 +1425,7 @@ function renderAll() {
   renderPolls();
   renderVehicles();
   renderIntel();
+  renderLatency();
   renderCards();
 }
 
@@ -1325,6 +1480,7 @@ function applySnapshot(msg) {
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
   renderAll();
+  scheduleLatencyRefresh(); // 重连/刷新后按最新水位重取时效统计（仅主持人会真正发请求）
 }
 
 function applyEvent(msg) {
@@ -1548,6 +1704,8 @@ function applyEvent(msg) {
       break;
   }
   renderAll();
+  // 影响时效统计的事件到达后，防抖重取所选轮次的报告（仅主持人）
+  if (LATENCY_EVENTS.has(msg.type)) scheduleLatencyRefresh();
 }
 
 /* 事件流里新增的卡片不带回执/答复字段（新卡/新揭示必然零回执、零答复），按角色补默认值；
@@ -1638,6 +1796,9 @@ function enterRoom(code, role) {
   state.polls = [];
   state.vehicles = null;
   state.claims = [];
+  state.latency = null;
+  state.latencyRound = null;
+  state.latencyError = null;
   state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
@@ -1659,6 +1820,9 @@ function enterObserver(token) {
   state.polls = [];
   state.vehicles = null;
   state.claims = [];
+  state.latency = null;
+  state.latencyRound = null;
+  state.latencyError = null;
   state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;
@@ -1701,6 +1865,13 @@ $('#btn-start').onclick  = () => api('POST', `/api/rooms/${state.code}/start`).c
 $('#btn-pause').onclick  = () => api('POST', `/api/rooms/${state.code}/pause`).catch(showError);
 $('#btn-resume').onclick = () => api('POST', `/api/rooms/${state.code}/resume`).catch(showError);
 $('#btn-reset').onclick  = () => api('POST', `/api/rooms/${state.code}/reset`).catch(showError);
+
+/* 响应时效面板（仅主持人）：切换轮次或手动刷新时重新取数 */
+$('#latency-round').onchange = () => {
+  state.latencyRound = parseInt($('#latency-round').value, 10);
+  fetchLatency();
+};
+$('#latency-refresh').onclick = () => fetchLatency();
 
 /* 导出复盘 ZIP：按点击瞬间的事件水位打包（服务端在锁内定水位，生成期间新事件不混入）。
    直接走浏览器下载，无需解析 JSON；导出进行中禁用按钮并提示。 */

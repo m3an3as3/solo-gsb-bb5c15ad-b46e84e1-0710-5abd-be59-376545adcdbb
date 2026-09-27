@@ -43,6 +43,11 @@
   且对立为零为已证实/已否定；其余为待核验。主持人实时看到逐组报告；
   参与组只见本组报告与汇总状态；观察席完全不可见。报告持久化，
   经快照与 WebSocket 恢复；重置清空报告但保留命题
+- 响应时效面板：主持人选择演练轮次，服务端在 state_lock 内固定事件水位，
+  复用时钟事件重建轮次与虚拟时间（暂停时长不计入），按卡片揭示时的目标组
+  逐卡计算到首次回执、首次答复的虚拟毫秒差；撤销回执/修改答复不改首次
+  响应时间，重置后从新轮统计；未响应记「未达」（不用墙钟补足），中位数
+  只取已响应样本、空样本为无数据；参与者与观察席拿不到分析数据
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -63,7 +68,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NamedTuple
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -71,6 +76,7 @@ from pydantic import BaseModel, Field
 from . import db as dbmod
 from . import export as reviewmod
 from . import intel as intelmod
+from . import latency as latencymod
 from . import polls as pollmod
 from . import vehicles as vehiclemod
 
@@ -1789,6 +1795,29 @@ async def export_review_zip(code: str):
             "Cache-Control": "no-store",
         },
     )
+
+
+# ---------------------------------------------------------------- REST：响应时效面板
+
+@app.get("/api/rooms/{code}/response-latency")
+async def response_latency(code: str, round_idx: int = Query(ge=0, alias="round")):
+    """主持人专用的响应时效分析：指定轮次、逐组逐卡的首次回执/首次答复虚拟时延。
+
+    与复盘包导出同一水位口径：在 state_lock 内（与所有写操作同一把锁）先读
+    high_water = MAX(events.id)，统计只消费 id <= 水位 的事件，分析期间到达的
+    新事件绝不混入。轮次与虚拟时间由时钟事件重建（暂停时长不计入）；未响应记
+    「未达」，不用墙钟补足。仅主持人可得：参与者/观察者没有房间码，快照与
+    事件流也不携带任何分析数据。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        high_water = db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events WHERE room_id = ?", (room["id"],)
+        ).fetchone()["m"]
+        report = latencymod.build_report(db, room, high_water, round_idx)
+        if report is None:
+            raise HTTPException(status_code=404, detail="round not found")
+        return report
 
 
 # ---------------------------------------------------------------- REST：时钟控制

@@ -582,3 +582,54 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-size: 13px;
   font-weight: 400;
 }
+
+/* ---------------------------------------------------------- 响应时效面板（仅主持人） */
+
+.latency-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+}
+.latency-controls select { width: auto; min-width: 160px; margin-bottom: 0; }
+.latency-controls button { white-space: nowrap; }
+.latency-controls .hint { margin: 0; }
+.latency-group {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.latency-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.latency-group-name { font-weight: 700; font-size: 14px; flex: 1; min-width: 0; }
+.latency-medians { display: flex; gap: 6px; flex-wrap: wrap; }
+.latency-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.latency-table th, .latency-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-top: 1px solid var(--border);
+  vertical-align: top;
+}
+.latency-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  border-top: none;
+  white-space: nowrap;
+}
+.latency-table td { font-family: ui-monospace, monospace; }
+.latency-table td:first-child { font-family: inherit; }
+.latency-miss { color: var(--muted); }
